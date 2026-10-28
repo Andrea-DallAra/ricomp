@@ -5,7 +5,7 @@ import { Settings } from '../lib/settings';
 import { useNow } from '../lib/hooks';
 import { today, longDate, diffDays, weekday, mondayOf } from '../lib/dates';
 import { fmt } from '../lib/format';
-import { sum, upcomingPlan, computeNeeds, foodMap, recipeMacros, logRecipe, qtyLabel, buyQty } from '../lib/nutrition';
+import { sum, upcomingPlan, computeNeeds, foodMap, recipeMacros, logRecipe, qtyLabel, buyQty, FREE, freeMealBudget } from '../lib/nutrition';
 import { weekNumber, phaseOf, activeWorkout } from '../lib/training';
 import { MEALS } from '../data/recipes';
 import { Icon, MacroBar, Sheet, Stepper, TopBar, Check, useToast } from '../components/ui';
@@ -31,12 +31,13 @@ export default function Today({ settings }: { settings: Settings }) {
     const plan = await upcomingPlan(2, settings.mealTimes);
     const p = plan[0];
     if (!p) return null;
+    if (p.recipeId === FREE) return { p, r: null as any, m: null as any, missing: [] as any[], free: await freeMealBudget(p.date, p.meal, settings.targets.kcal) };
     const r = await db.recipes.get(p.recipeId);
     if (!r) return null;
     const foods = await foodMap();
     const missing = (await computeNeeds([p])).filter((n) => n.missing > 0).map((n) => ({ food: foods.get(n.foodId), g: n.missing }));
-    return { p, r, m: recipeMacros(r, foods, p.servings), missing };
-  }, [settings.mealTimes, logs.length]);
+    return { p, r, m: recipeMacros(r, foods, p.servings), missing, free: 0 };
+  }, [settings.mealTimes, settings.targets.kcal, logs.length]);
 
   const [sheet, setSheet] = useState<'' | 'peso' | 'passi'>('');
   const [val, setVal] = useState<number | null>(null);
@@ -130,7 +131,16 @@ export default function Today({ settings }: { settings: Settings }) {
 
       <div className="panel">
         <h2>Prossimo pasto {next && <small>{next.p.date === d ? '' : 'domani · '}{MEALS.find((m) => m.key === next.p.meal)?.label} {settings.mealTimes[next.p.meal]}</small>}</h2>
-        {next ? (
+        {next && next.free ? (
+          <>
+            <div style={{ fontWeight: 600, fontSize: 17 }}>Pasto libero</div>
+            <div className="muted small" style={{ marginBottom: 10 }}>Margine di circa {fmt(next.free)} kcal per chiudere la giornata in pari. Scegli quello che vuoi, ma cerca almeno 35–40 g di proteine.</div>
+            <div className="row">
+              <a className="btn primary grow" href="#/dieta">Registra cosa mangi</a>
+              <a className="btn ghost" href="#/dieta/piano">Cambia</a>
+            </div>
+          </>
+        ) : next ? (
           <>
             <div style={{ fontWeight: 600, fontSize: 17 }}>{next.r.name}</div>
             <div className="muted small" style={{ marginBottom: 10 }}>{fmt(next.m.kcal)} kcal · P {fmt(next.m.p)} · C {fmt(next.m.c)} · G {fmt(next.m.f)}</div>

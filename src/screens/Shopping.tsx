@@ -72,7 +72,7 @@ function List({ settings }: { settings: Settings }) {
 
       {next && (
         <div className={`callout ${next.missing.length ? '' : 'ok'}`} style={{ marginBottom: 12 }}>
-          <b>Prossimo pasto</b> ({nextLabel}): {next.r?.name}.{' '}
+          <b>Prossimo pasto</b> ({nextLabel}): {next.p.recipeId === 'libero' ? 'pasto libero' : next.r?.name}.{' '}
           {next.missing.length
             ? <>Manca: {next.missing.map((n) => fm.get(n.foodId)?.name || n.foodId).join(', ')}.</>
             : <>Hai già tutto in casa.</>}

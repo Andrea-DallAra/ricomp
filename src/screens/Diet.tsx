@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db, LogEntry } from '../db';
 import type { Food } from '../data/foods';
@@ -6,22 +6,25 @@ import { MEALS, MealKey, Recipe } from '../data/recipes';
 import { Settings } from '../lib/settings';
 import { today, relDay, longDate, addDays } from '../lib/dates';
 import { fmt, uid } from '../lib/format';
-import { sum, recipeMacros, foodMap, logRecipe, logFood, logQuick, macrosFor, qtyLabel } from '../lib/nutrition';
+import { sum, recipeMacros, foodMap, logRecipe, logFood, logQuick, macrosFor, qtyLabel, FREE, freeMealBudget, ensurePlan, resetToBase } from '../lib/nutrition';
+import { updateSettings, DEFAULT_BASE } from '../lib/settings';
+import { weekday, DAYS } from '../lib/dates';
 import { lookupBarcode } from '../lib/off';
 import { DateNav, Icon, Seg, Sheet, Stepper, TopBar, useToast, Empty, num } from '../components/ui';
 import { FoodPicker, GramsPicker, FoodForm } from '../components/Food';
 import { Scanner } from '../components/Scanner';
 
-type Sub = 'diario' | 'piano' | 'ricette' | 'alimenti';
+type Sub = 'diario' | 'piano' | 'base' | 'ricette' | 'alimenti';
 
 export default function Diet({ sub, settings }: { sub?: string; settings: Settings }) {
-  const tab = (['diario', 'piano', 'ricette', 'alimenti'].includes(sub || '') ? sub : 'diario') as Sub;
+  const tab = (['diario', 'piano', 'base', 'ricette', 'alimenti'].includes(sub || '') ? sub : 'diario') as Sub;
   return (
     <>
       <TopBar title="Dieta" sub={`${fmt(settings.targets.kcal)} kcal · P ${settings.targets.p} · C ${settings.targets.c} · G ${settings.targets.f}`} />
-      <Seg value={tab} onChange={(v) => (location.hash = '/dieta/' + v)} options={[{ v: 'diario', l: 'Diario' }, { v: 'piano', l: 'Piano' }, { v: 'ricette', l: 'Ricette' }, { v: 'alimenti', l: 'Alimenti' }]} />
+      <Seg value={tab} onChange={(v) => (location.hash = '/dieta/' + v)} options={[{ v: 'diario', l: 'Diario' }, { v: 'piano', l: 'Piano' }, { v: 'base', l: 'Base' }, { v: 'ricette', l: 'Ricette' }, { v: 'alimenti', l: 'Alimenti' }]} />
       {tab === 'diario' && <Diary settings={settings} />}
       {tab === 'piano' && <Planner settings={settings} />}
+      {tab === 'base' && <BaseWeek settings={settings} />}
       {tab === 'ricette' && <Recipes />}
       {tab === 'alimenti' && <Foods />}
     </>
@@ -40,11 +43,18 @@ function Diary({ settings }: { settings: Settings }) {
   const fm = useLiveQuery(() => foodMap()) || new Map();
   const t = settings.targets;
   const tot = sum(logs);
+  const freeBudget: Record<string, number> = useLiveQuery(async () => {
+    const out: Record<string, number> = {};
+    for (const p of plan) if (p.recipeId === FREE && !p.done) out[p.meal] = await freeMealBudget(date, p.meal, t.kcal);
+    return out;
+  }, [date, logs.length, plan.length, plan.map((p) => p.recipeId + p.done).join()]) || {};
 
   const remove = async (items: LogEntry[]) => {
     await db.logs.bulkDelete(items.map((x) => x.id!));
     const recipeId = items[0]?.recipeId;
-    if (recipeId) { const p = plan.find((x) => x.recipeId === recipeId && x.meal === items[0].meal); if (p) await db.plan.update(p.id, { done: false }); }
+    const meal = items[0].meal;
+    const left = await db.logs.where('date').equals(date).filter((l) => l.meal === meal).count();
+    if (!left && (await db.plan.get(`${date}_${meal}`))) await db.plan.update(`${date}_${meal}`, { done: false });
     toast('Voce eliminata', { label: 'Annulla', run: () => db.logs.bulkAdd(items.map(({ id, ...r }) => r)) });
   };
 
@@ -68,6 +78,7 @@ function Diary({ settings }: { settings: Settings }) {
         for (const it of items) { const k = it.group || 'x' + it.id; groups.set(k, [...(groups.get(k) || []), it]); }
         const p = plan.find((x) => x.meal === m.key);
         const pr = p && !p.done ? rmap.get(p.recipeId) : null;
+        const isFree = !!p && !p.done && p.recipeId === FREE;
         return (
           <section key={m.key}>
             <div className="section-title">{m.label}<small>{fmt(sum(items).kcal)} kcal</small></div>
@@ -86,6 +97,12 @@ function Diary({ settings }: { settings: Settings }) {
                     </li>
                   );
                 })}
+                {isFree && (
+                  <li className="li">
+                    <div className="grow"><div className="t">Pasto libero</div><div className="s">Margine ~{fmt(freeBudget[m.key] || 0)} kcal · cerca 35–40 g di proteine</div></div>
+                    <button className="btn small primary" onClick={() => setAdding(m.key)}>Registra</button>
+                  </li>
+                )}
                 {pr && (
                   <li className="li">
                     <div className="grow"><div className="t">{pr.name}</div><div className="s">In programma · {fmt(recipeMacros(pr, fm, p!.servings).kcal)} kcal</div></div>
@@ -100,6 +117,7 @@ function Diary({ settings }: { settings: Settings }) {
           </section>
         );
       })}
+      <p className="small muted">Hai mangiato qualcos'altro? Aggiungilo al pasto: prende il posto di quello in programma e la dispensa si aggiorna.</p>
       {adding && <AddSheet date={date} meal={adding} onClose={() => setAdding(null)} />}
     </>
   );
@@ -196,6 +214,21 @@ function RecipeDetail({ recipe, servings, fm }: { recipe: Recipe; servings: numb
 }
 
 /* ---------------- Piano pasti ---------------- */
+function RecipeSelect({ meal, value, recipes, onChange, dim }: { meal: MealKey; value: string; recipes: Recipe[]; onChange: (v: string) => void; dim?: boolean }) {
+  return (
+    <select className="grow" value={value} onChange={(e) => onChange(e.target.value)} style={{ opacity: dim ? 0.5 : 1 }}>
+      <option value="">— niente —</option>
+      <option value={FREE}>Pasto libero</option>
+      {recipes.filter((r) => r.meal === meal).map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
+      <optgroup label="Altre ricette">{recipes.filter((r) => r.meal !== meal).map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}</optgroup>
+    </select>
+  );
+}
+
+function dayKcal(entries: { recipeId: string; servings?: number }[], recipes: Recipe[], fm: Map<string, Food>) {
+  return sum(entries.map((p) => { const r = recipes.find((x) => x.id === p.recipeId); return r ? recipeMacros(r, fm, p.servings || 1) : { kcal: 0, p: 0, c: 0, f: 0 }; }));
+}
+
 function Planner({ settings }: { settings: Settings }) {
   const toast = useToast();
   const start = today();
@@ -203,60 +236,89 @@ function Planner({ settings }: { settings: Settings }) {
   const plan = useLiveQuery(() => db.plan.where('date').between(start, days[6], true, true).toArray(), [start]) || [];
   const recipes = useLiveQuery(() => db.recipes.toArray()) || [];
   const fm = useLiveQuery(() => foodMap()) || new Map();
-  const byMeal = (m: MealKey) => recipes.filter((r) => r.meal === m);
   const get = (d: string, m: MealKey) => plan.find((p) => p.id === `${d}_${m}`);
+  useEffect(() => { ensurePlan(); }, [start]);
 
   const setSlot = async (d: string, m: MealKey, recipeId: string) => {
-    if (!recipeId) await db.plan.delete(`${d}_${m}`);
-    else await db.plan.put({ id: `${d}_${m}`, date: d, meal: m, recipeId, servings: 1, done: false });
-  };
-
-  const autofill = async () => {
-    let n = 0;
-    for (const [di, d] of days.entries()) for (const m of MEALS) {
-      if (get(d, m.key)) continue;
-      const opts = byMeal(m.key);
-      if (!opts.length) continue;
-      // rotazione: lo stesso piatto torna ogni 2–3 giorni, comodo per cucinare in anticipo
-      const r = opts[Math.floor(di / 2) % opts.length];
-      await db.plan.put({ id: `${d}_${m.key}`, date: d, meal: m.key, recipeId: r.id, servings: 1, done: false });
-      n++;
-    }
-    toast(n ? `${n} pasti pianificati` : 'La settimana è già piena');
+    await db.plan.put({ id: `${d}_${m}`, date: d, meal: m, recipeId, servings: 1, done: false, auto: false });
   };
 
   return (
     <>
-      <div className="row" style={{ marginBottom: 12 }}>
-        <button className="btn primary grow" onClick={autofill}>Riempi i giorni vuoti</button>
-        <a className="btn ghost" href="#/spesa">Lista spesa</a>
+      <div className="callout ok" style={{ marginBottom: 12 }}>
+        Ogni giorno segue la <a href="#/dieta/base" style={{ color: 'inherit', fontWeight: 600 }}>dieta base</a>. Qui cambi un singolo pasto quando ti serve un'alternativa: vale solo per quel giorno.
       </div>
-      <p className="muted small" style={{ marginTop: 0 }}>I piatti si ripetono ogni 2 giorni: cucini una volta per due giorni, senza freezer. La lista della spesa usa questo piano.</p>
       {days.map((d) => {
         const dayPlan = plan.filter((p) => p.date === d);
-        const kcal = sum(dayPlan.map((p) => { const r = recipes.find((x) => x.id === p.recipeId); return r ? recipeMacros(r, fm, p.servings) : { kcal: 0, p: 0, c: 0, f: 0 }; }));
+        const k = dayKcal(dayPlan, recipes, fm);
+        const changed = dayPlan.some((p) => p.auto === false && !p.done);
+        const hasFree = dayPlan.some((p) => p.recipeId === FREE);
         return (
           <section key={d}>
-            <div className="section-title">{relDay(d)}<small>{dayPlan.length ? `${fmt(kcal.kcal)} kcal · P ${fmt(kcal.p)} g` : 'vuoto'}</small></div>
+            <div className="section-title">{relDay(d)}<small>{fmt(k.kcal)} kcal{hasFree ? ' + pasto libero' : ''} · P {fmt(k.p)} g</small></div>
             <div className="panel flush">
               {MEALS.map((m) => {
                 const p = get(d, m.key);
                 return (
                   <div key={m.key} className="li" style={{ gap: 10 }}>
-                    <div style={{ width: 82 }} className="small muted">{m.label}</div>
-                    <select className="grow" value={p?.recipeId || ''} onChange={(e) => setSlot(d, m.key, e.target.value)} style={{ opacity: p?.done ? 0.5 : 1 }}>
-                      <option value="">—</option>
-                      {byMeal(m.key).map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
-                      <optgroup label="Altre ricette">{recipes.filter((r) => r.meal !== m.key).map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}</optgroup>
-                    </select>
+                    <div style={{ width: 78 }} className="small muted">{m.label}{p?.auto === false && !p.done ? <div style={{ color: 'var(--warn)' }}>cambiato</div> : null}</div>
+                    <RecipeSelect meal={m.key} value={p?.recipeId || ''} recipes={recipes} onChange={(v) => setSlot(d, m.key, v)} dim={p?.done} />
                     {p?.done && <Icon name="check" size={18} />}
                   </div>
                 );
               })}
+              {changed && (
+                <div className="li tap" style={{ color: 'var(--lime)', fontWeight: 600 }} onClick={async () => { await resetToBase(d); toast(`${relDay(d)} riportato alla dieta base`); }}>
+                  <Icon name="history" size={20} /> Torna alla dieta base
+                </div>
+              )}
             </div>
           </section>
         );
       })}
+    </>
+  );
+}
+
+function BaseWeek({ settings }: { settings: Settings }) {
+  const toast = useToast();
+  const recipes = useLiveQuery(() => db.recipes.toArray()) || [];
+  const fm = useLiveQuery(() => foodMap()) || new Map();
+  const base = settings.baseDiet;
+  const order = [1, 2, 3, 4, 5, 6, 0];
+  const set = async (wd: number, meal: MealKey, v: string) => {
+    const next = { ...base, [wd]: { ...(base[wd] || {}), [meal]: v } };
+    if (!v) delete next[wd][meal];
+    await updateSettings({ baseDiet: next });
+    await ensurePlan();
+  };
+  const free = order.reduce((a, wd) => a + MEALS.filter((m) => base[wd]?.[m.key] === FREE).length, 0);
+  const avg = order.reduce((a, wd) => a + dayKcal(MEALS.map((m) => ({ recipeId: base[wd]?.[m.key] || '' })), recipes, fm).kcal, 0) / 7;
+  return (
+    <>
+      <p className="muted small" style={{ marginTop: 0 }}>La settimana tipo che l'app ripete ogni settimana. I piatti si ripetono a coppie di giorni: cucini una volta per due giorni. Le modifiche valgono da oggi in poi, tranne i giorni che hai cambiato a mano.</p>
+      <div className="grid2" style={{ marginBottom: 12 }}>
+        <div className="stat"><div className="k">Pasti liberi a settimana</div><div className="v">{free}</div><div className="d">1–2 vanno bene in ricomposizione</div></div>
+        <div className="stat"><div className="k">Media giorni pianificati</div><div className="v">{fmt(avg)}<small>kcal</small></div><div className="d">pasti liberi esclusi</div></div>
+      </div>
+      {order.map((wd) => {
+        const k = dayKcal(MEALS.map((m) => ({ recipeId: base[wd]?.[m.key] || '' })), recipes, fm);
+        const hasFree = MEALS.some((m) => base[wd]?.[m.key] === FREE);
+        return (
+          <section key={wd}>
+            <div className="section-title">{DAYS[wd].replace(/^\w/, (c) => c.toUpperCase())}<small>{fmt(k.kcal)} kcal{hasFree ? ' + libero' : ''} · P {fmt(k.p)} g</small></div>
+            <div className="panel flush">
+              {MEALS.map((m) => (
+                <div key={m.key} className="li" style={{ gap: 10 }}>
+                  <div style={{ width: 78 }} className="small muted">{m.label}</div>
+                  <RecipeSelect meal={m.key} value={base[wd]?.[m.key] || ''} recipes={recipes} onChange={(v) => set(wd, m.key, v)} />
+                </div>
+              ))}
+            </div>
+          </section>
+        );
+      })}
+      <button className="btn ghost block" style={{ margin: '12px 0' }} onClick={async () => { await updateSettings({ baseDiet: JSON.parse(JSON.stringify(DEFAULT_BASE)) }); await resetToBase(); toast('Dieta base originale ripristinata'); }}>Ripristina la dieta base originale</button>
     </>
   );
 }

@@ -63,6 +63,7 @@ export async function messageFor(id: string, s: Settings): Promise<Note | null> 
     const p = await db.plan.get(`${d}_${meal}`);
     const label = MEALS.find((m) => m.key === meal)?.label || 'Pasto';
     if (p?.done) return null;
+    if (p?.recipeId === 'libero') return { title: `${label}: pasto libero`, body: 'Goditelo, e punta comunque a 35–40 g di proteine. Registralo quando hai finito.', url: '#/dieta', tag: 'pasto' };
     const r = p ? await db.recipes.get(p.recipeId) : null;
     return { title: `${label}`, body: r ? `In programma: ${r.name}. Segnalo come mangiato.` : 'Registra cosa mangi per restare nei macro.', url: '#/dieta', tag: 'pasto' };
   }

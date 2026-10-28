@@ -1,6 +1,8 @@
 import React, { useEffect } from 'react';
 import { Icon, ToastProvider, useToast } from './components/ui';
-import { useHashRoute, useSettings } from './lib/hooks';
+import { useHashRoute, useSettings, useNow } from './lib/hooks';
+import { ensurePlan } from './lib/nutrition';
+import { today } from './lib/dates';
 import { startLocalReminders, syncSchedule } from './lib/push';
 import Today from './screens/Today';
 import Diet from './screens/Diet';
@@ -29,6 +31,10 @@ function Shell() {
   const schedKey = settings ? JSON.stringify([settings.reminders, settings.mealTimes, settings.program.schedule, settings.push.enabled]) : '';
   useEffect(() => { if (settings?.push.enabled) syncSchedule().catch(() => {}); }, [schedKey]);
   useEffect(() => { window.scrollTo(0, 0); }, [root]);
+  // la dieta base riempie da sola i prossimi 7 giorni (anche a cambio giorno)
+  useNow();
+  const day = today();
+  useEffect(() => { ensurePlan().catch(() => {}); }, [day, JSON.stringify(settings?.baseDiet)]);
 
   if (!settings) return null;
   const screen = (() => {

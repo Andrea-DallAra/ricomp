@@ -18,6 +18,21 @@ export type Settings = {
   reminders: Reminder[];
   push: { url: string; secret: string; enabled: boolean };
   lastBackup?: string;
+  /** Dieta base: giorno della settimana (0 = domenica) -> pasto -> id ricetta o 'libero' */
+  baseDiet: Record<number, Record<string, string>>;
+};
+
+export const FREE = 'libero';
+
+// Settimana base: si cucina a blocchi di 2 giorni (frigo senza freezer), 1 pasto libero il sabato sera.
+export const DEFAULT_BASE: Record<number, Record<string, string>> = {
+  1: { colazione: 'col_porridge', pranzo: 'pra_ragu', spuntino: 'spu_shaker', cena: 'cen_hamburger' },
+  2: { colazione: 'col_uova', pranzo: 'pra_ragu', spuntino: 'spu_shaker', cena: 'cen_hamburger' },
+  3: { colazione: 'col_porridge', pranzo: 'pra_riso_pollo', spuntino: 'spu_panino', cena: 'cen_carbonara' },
+  4: { colazione: 'col_yogurt', pranzo: 'pra_riso_pollo', spuntino: 'spu_shaker', cena: 'cen_carbonara' },
+  5: { colazione: 'col_porridge', pranzo: 'pra_lonza', spuntino: 'spu_shaker', cena: 'cen_salmone' },
+  6: { colazione: 'col_uova', pranzo: 'pra_lonza', spuntino: 'spu_yogurt', cena: FREE },
+  0: { colazione: 'col_yogurt', pranzo: 'pra_ragu', spuntino: 'spu_panino', cena: 'cen_tortilla' },
 };
 
 export const DEFAULT_REMINDERS: Reminder[] = [
@@ -38,9 +53,10 @@ export const defaultSettings = (): Settings => ({
   shopDays: 3,
   reminders: DEFAULT_REMINDERS,
   push: { url: '', secret: '', enabled: false },
+  baseDiet: JSON.parse(JSON.stringify(DEFAULT_BASE)),
 });
 
-const SEED_VERSION = 1;
+const SEED_VERSION = 2;
 
 export async function seed() {
   const v = (await db.kv.get('seedVersion'))?.value ?? 0;
@@ -59,6 +75,10 @@ export async function seed() {
     }
     await db.kv.put({ key: 'seedVersion', value: SEED_VERSION });
   });
+  if (v < 2) {
+    // v2: da ora in poi i giorni futuri seguono la dieta base; i piani fatti a mano non ancora mangiati si azzerano
+    await db.plan.where('date').aboveOrEqual(today()).filter((p) => !p.done).delete();
+  }
 }
 
 export async function getSettings(): Promise<Settings> {

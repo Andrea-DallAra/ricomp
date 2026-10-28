@@ -2,7 +2,8 @@ import { db, LogEntry, PlanEntry } from '../db';
 import type { Food } from '../data/foods';
 import type { Recipe, MealKey } from '../data/recipes';
 import { uid } from './format';
-import { addDays, today, toMin, hhmm } from './dates';
+import { addDays, today, toMin, hhmm, weekday } from './dates';
+import { getSettings, FREE } from './settings';
 
 export type Macros = { kcal: number; p: number; c: number; f: number };
 export const ZERO: Macros = { kcal: 0, p: 0, c: 0, f: 0 };
@@ -51,14 +52,22 @@ export async function deductPantry(items: { foodId?: string; g: number }[]) {
   }
 }
 
+/** Qualsiasi cosa registrata in un pasto conta come "pasto fatto" per il piano (anche un'alternativa). */
+export async function markMealDone(date: string, meal: MealKey) {
+  const id = `${date}_${meal}`;
+  if (await db.plan.get(id)) await db.plan.update(id, { done: true });
+}
+
 export async function logFood(date: string, meal: MealKey, food: Food, g: number, opts: { deduct?: boolean } = {}) {
   const m = macrosFor(food, g);
   await db.logs.add({ date, meal, foodId: food.id, name: food.name, g, ...m, ts: Date.now() });
   if (opts.deduct !== false) await deductPantry([{ foodId: food.id, g }]);
+  await markMealDone(date, meal);
 }
 
 export async function logQuick(date: string, meal: MealKey, name: string, m: Macros) {
   await db.logs.add({ date, meal, name: name || 'Voce rapida', g: 0, ...m, ts: Date.now() });
+  await markMealDone(date, meal);
 }
 
 export async function logRecipe(date: string, meal: MealKey, r: Recipe, servings = 1, opts: { deduct?: boolean } = {}) {
@@ -72,9 +81,7 @@ export async function logRecipe(date: string, meal: MealKey, r: Recipe, servings
   });
   await db.logs.bulkAdd(rows);
   if (opts.deduct !== false) await deductPantry(rows.map((x) => ({ foodId: x.foodId, g: x.g })));
-  const planId = `${date}_${meal}`;
-  const p = await db.plan.get(planId);
-  if (p && p.recipeId === r.id) await db.plan.update(planId, { done: true });
+  await markMealDone(date, meal);
 }
 
 export const MEAL_ORDER: MealKey[] = ['colazione', 'pranzo', 'spuntino', 'cena'];
@@ -86,7 +93,7 @@ export async function upcomingPlan(days: number, mealTimes: Record<string, strin
   const rows = await db.plan.where('date').between(t, end, true, true).toArray();
   const now = toMin(hhmm());
   return rows
-    .filter((r) => !r.done)
+    .filter((r) => !r.done && !!r.recipeId)
     .filter((r) => r.date !== t || toMin(mealTimes[r.meal] || '23:59') + 90 >= now)
     .sort((a, b) => (a.date === b.date ? MEAL_ORDER.indexOf(a.meal) - MEAL_ORDER.indexOf(b.meal) : a.date < b.date ? -1 : 1));
 }
@@ -116,3 +123,51 @@ export function buyQty(food: Food | undefined, g: number): number {
   if (g <= 50) return Math.ceil(g / 10) * 10;
   return Math.ceil(g / 50) * 50;
 }
+
+/** Riempie i prossimi `days` giorni con la dieta base. Le modifiche fatte a mano (auto=false) restano. */
+export async function ensurePlan(days = 7) {
+  const s = await getSettings();
+  const t = today();
+  const existing = new Map((await db.plan.where('date').between(t, addDays(t, days - 1), true, true).toArray()).map((p) => [p.id, p]));
+  const puts: PlanEntry[] = [];
+  for (let i = 0; i < days; i++) {
+    const d = addDays(t, i);
+    const base = s.baseDiet[weekday(d)] || {};
+    for (const meal of MEAL_ORDER) {
+      const id = `${d}_${meal}`;
+      const cur = existing.get(id);
+      const want = base[meal];
+      if (cur && (cur.done || cur.auto === false)) continue;
+      if (!want) { if (cur) await db.plan.delete(id); continue; }
+      if (!cur || cur.recipeId !== want) puts.push({ id, date: d, meal, recipeId: want, servings: 1, done: false, auto: true });
+    }
+  }
+  if (puts.length) await db.plan.bulkPut(puts);
+}
+
+/** Riporta un giorno (o tutti i prossimi 7) alla dieta base. */
+export async function resetToBase(date?: string) {
+  const t = today();
+  const q = date ? db.plan.where('date').equals(date) : db.plan.where('date').aboveOrEqual(t);
+  await q.filter((p) => !p.done).delete();
+  await ensurePlan();
+}
+
+/** Calorie disponibili per un pasto libero: target del giorno meno gli altri pasti (mangiati o in programma). */
+export async function freeMealBudget(date: string, meal: MealKey, target: number): Promise<number> {
+  const logs = await db.logs.where('date').equals(date).toArray();
+  const plan = await db.plan.where('date').equals(date).toArray();
+  const foods = await foodMap();
+  let used = 0;
+  for (const m of MEAL_ORDER) {
+    if (m === meal) continue;
+    const ml = logs.filter((l) => l.meal === m);
+    if (ml.length) { used += sum(ml).kcal; continue; }
+    const p = plan.find((x) => x.meal === m);
+    const r = p && p.recipeId !== FREE ? await db.recipes.get(p.recipeId) : null;
+    if (r) used += recipeMacros(r, foods, p!.servings).kcal;
+  }
+  return Math.max(300, Math.round((target - used) / 50) * 50);
+}
+
+export { FREE };

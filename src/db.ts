@@ -6,7 +6,7 @@ export type LogEntry = {
   id?: number; date: string; meal: MealKey; foodId?: string; name: string; g: number;
   kcal: number; p: number; c: number; f: number; recipeId?: string; group?: string; ts: number;
 };
-export type PlanEntry = { id: string; date: string; meal: MealKey; recipeId: string; servings: number; done?: boolean };
+export type PlanEntry = { id: string; date: string; meal: MealKey; recipeId: string; servings: number; done?: boolean; auto?: boolean };
 export type PantryItem = { foodId: string; g: number };
 export type ShopItem = { id?: number; name: string; qty?: string; checked: boolean; foodId?: string; g?: number; auto?: boolean };
 export type Day = { date: string; water?: number; steps?: number; creatina?: boolean; sleep?: number };
